@@ -342,7 +342,95 @@ class ReferenceRangeManager:
                 return 'critically_high'
         
         return 'unknown'
-    
+
+    def distance_from_normal(
+        self,
+        test_name: str,
+        value: float,
+        gender: str = "unisex",
+        units: Optional[str] = None,
+    ) -> Tuple[float, str]:
+        """
+        Возвращает:
+          dist (float) ∈ [0, +∞): непрерывная дистанция от границы нормы.
+          actual_status (str): one of {"normal","below_normal","above_normal","critically_low","critically_high","unknown"}.
+
+        Определения:
+          - Если value в норме → dist = 0.
+          - Если выше max → dist = (value - max) / max.
+          - Если ниже min → dist = (min - value) / min.
+          - Если нет референсов → dist = 0, status="unknown".
+
+        Примечание:
+          Статус берём из уже существующей логики calculate_status, чтобы не дублировать правила.
+        """
+        status = self.calculate_status(test_name, value, gender, units)
+
+        # Найдём референсные границы, чтобы посчитать dist
+        found = self.find_test(test_name)
+        if not found:
+            return 0.0, "unknown"
+
+        _category, test_data = found
+        # берём гендерно-специфичный диапазон если задан
+        ref = None
+        if isinstance(test_data.get("normal_range"), dict):
+            # ВАЖНО: сначала проверяем, не является ли это уже готовым диапазоном
+            if 'min' in test_data["normal_range"] and 'max' in test_data["normal_range"]:
+                # Это диапазон без разделения по полу (unisex)
+                ref = test_data["normal_range"]
+            else:
+                # Это структура с разделением по полу
+                ref = test_data["normal_range"].get(gender) or test_data["normal_range"].get("unisex")
+                # Если это вложенная структура с полом
+                if ref and not ('min' in ref and 'max' in ref):
+                    # Попробуем взять unisex или первый доступный
+                    ref = test_data["normal_range"].get("unisex")
+                    if not ref or not ('min' in ref and 'max' in ref):
+                        for key, rng in test_data["normal_range"].items():
+                            if isinstance(rng, dict) and 'min' in rng and 'max' in rng:
+                                ref = rng
+                                break
+        elif isinstance(test_data.get("normal_range"), (list, tuple)):
+            # если где-то хранятся списком (на всякий)
+            ref = test_data["normal_range"][0] if test_data["normal_range"] else None
+
+        if not ref:
+            return 0.0, status
+
+        # попытка нормализации единиц
+        unit_in = (units or "").strip().lower()
+        unit_ref = (test_data.get("units") or "").strip().lower()
+        v = value
+        try:
+            if unit_in and unit_ref and unit_in != unit_ref:
+                v = self.unit_converter.convert(value, unit_in, unit_ref)
+        except Exception:
+            # если не смогли конвертировать — считаем как есть
+            v = value
+
+        try:
+            ref_min = float(ref.get("min")) if ref.get("min") is not None else None
+            ref_max = float(ref.get("max")) if ref.get("max") is not None else None
+        except Exception:
+            return 0.0, status
+
+        # если нет границ — окей, дистанс 0
+        if ref_min is None and ref_max is None:
+            return 0.0, status
+
+        # посчитаем dist относительно "ближней" границы
+        if ref_max is not None and v > ref_max:
+            base = ref_max if ref_max != 0 else abs(v) or 1.0
+            dist = max(0.0, (v - ref_max) / base)
+        elif ref_min is not None and v < ref_min:
+            base = ref_min if ref_min != 0 else abs(v) or 1.0
+            dist = max(0.0, (ref_min - v) / base)
+        else:
+            dist = 0.0
+
+        return float(dist), status
+
     @staticmethod
     def _normalize(name: str) -> str:
         """Нормализация названия теста"""
@@ -413,6 +501,165 @@ class IDFCalculator:
         return f"{normalized}:{status}"
 
 
+# ── Конфигурация скоринга ─────────────────────────────────────────────────────
+@dataclass
+class ScoringConfig:
+    # насыщение нелинейности по дистанции: dist/D0 → [0..1]
+    D0: float = 0.30
+    # сколько «неожиданных» штрафов учитывать максимум на болезнь
+    TOP_M_UNEXPECTED: int = 7
+    # сглаживание суммы штрафов: sqrt(sum(p_i^2))
+    USE_RMS_FOR_UNEXPECTED: bool = True
+    # верхний кап на суммарный штраф (доля от max_possible_score)
+    CONTRADICTION_CAP_FRAC: float = 0.6
+
+SCORING = ScoringConfig()
+
+
+# ── Функции тяжести и нелинейности ─────────────────────────────────────────────
+def severity_multiplier(expected: str, actual: str) -> float:
+    """
+    Возвращает множитель >0 при согласии направлений, <0 при противоречии,
+    небольшой отрицательный при «ожидали норму» → вышли за неё.
+    """
+    norm = "normal"
+    # нормализуем ключи
+    e = (expected or "").lower()
+    a = (actual or "").lower()
+
+    # карта направлений в условные «знаки»
+    def sign(s: str) -> int:
+        if s in ("above_normal", "critically_high"):
+            return +1
+        if s in ("below_normal", "critically_low"):
+            return -1
+        if s in ("normal",):
+            return 0
+        return 0
+
+    # «класс тяжести»
+    def sev(s: str) -> int:
+        if s in ("critically_high", "critically_low"):
+            return 2
+        if s in ("above_normal", "below_normal"):
+            return 1
+        if s in ("normal",):
+            return 0
+        return 0
+
+    se = sev(e)
+    sa = sev(a)
+    sig_e = sign(e)
+    sig_a = sign(a)
+
+    if e == norm and a == norm:
+        return +0.0  # ни бонуса, ни штрафа
+    if e == norm and a != norm:
+        # ожидали норму, а вышли — маленький минус, растёт с тяжестью факта
+        return -0.2 if sa == 1 else -0.5
+    if e != norm and a == norm:
+        # ожидали отклонение, а его нет — умеренный минус
+        return -0.6 if se == 1 else -1.0
+
+    # оба не-норма
+    if sig_e == sig_a:
+        # совпало направление: плюс, сильнее для critical
+        return +1.0 if (se == 1 and sa == 1) else +1.5
+    else:
+        # противоположные направления: заметный минус
+        return -1.0 if (se == 1 and sa == 1) else -1.5
+
+
+def distance_gain(dist: float, D0: Optional[float] = None) -> float:
+    """
+    Преобразует «на сколько вышли за норму» в [0..1].
+    Используем сглаживание: g = 1 - exp(-dist / D0), где D0~0.3 по умолчанию.
+    """
+    if D0 is None:
+        D0 = SCORING.D0
+    if dist <= 0:
+        return 0.0
+    # мягкая сатурация
+    g = 1.0 - math.exp(-float(dist) / float(D0))
+    # для очень больших dist ограничим 1.0
+    return 1.0 if g > 1.0 else float(g)
+
+
+def continuous_contribution(idf_weight: float, mult: float, dist: float) -> float:
+    """
+    Вклад (положительный), когда ожидаемое совпало по направлению.
+    mult — выход severity_multiplier (ожидаем >0).
+    
+    Гибридная формула:
+    - Базовый вклад 70% IDF за совпадение статуса
+    - Бонус 30% IDF × distance_gain за величину отклонения
+    
+    Это даёт:
+    - Минимум 70% IDF при совпадении статуса (даже если dist мал)
+    - До 100% IDF при больших отклонениях
+    """
+    if idf_weight is None or idf_weight <= 0:
+        return 0.0
+    
+    if mult <= 0:
+        return 0.0
+    
+    # Базовый вклад за совпадение статуса (70% от IDF)
+    base_contribution = 0.7 * float(idf_weight) * float(mult)
+    
+    # Бонус за величину отклонения (до 30% от IDF)
+    g = distance_gain(dist)
+    distance_bonus = 0.3 * float(idf_weight) * float(mult) * g
+    
+    return base_contribution + distance_bonus
+
+
+def continuous_penalty(idf_weight: float, mult: float, dist: float) -> float:
+    """
+    Штраф (положительное число), когда есть противоречие или «не в паттерне».
+    mult — |severity_multiplier| либо небольшой минус в случаях с нормой.
+    """
+    if idf_weight is None or idf_weight <= 0:
+        return 0.0
+    g = distance_gain(dist)
+    return abs(float(idf_weight) * float(mult) * g)
+
+
+def disease_categories_from_patterns(patterns: List) -> set:
+    """
+    Извлекает множество категорий, в которых у болезни заданы паттерны.
+    """
+    cats = set()
+    for p in patterns:
+        cat = getattr(p, "category", None) or (p.get("category") if isinstance(p, dict) else None)
+        if cat:
+            cats.add(str(cat))
+    return cats
+
+
+def aggregate_unexpected_penalties(
+    unexpected_entries: List[Dict],
+    max_m: Optional[int] = None,
+    use_rms: bool = True
+) -> float:
+    """
+    unexpected_entries: список словарей вида
+        {"penalty": float, "test_name": str, ...} (penalty >= 0)
+    Берём top-M по penalty, затем либо суммируем RMS, либо обычную сумму.
+    """
+    if not unexpected_entries:
+        return 0.0
+    if max_m is None:
+        max_m = SCORING.TOP_M_UNEXPECTED
+
+    top = sorted(unexpected_entries, key=lambda x: x.get("penalty", 0.0), reverse=True)[:max_m]
+    vals = [max(0.0, float(x.get("penalty", 0.0))) for x in top]
+
+    if use_rms:
+        return math.sqrt(sum(v * v for v in vals))
+    return sum(vals)
+
+
 class DiseaseSearchEngine:
     """
     Поисковый движок для определения заболеваний
@@ -428,6 +675,9 @@ class DiseaseSearchEngine:
         
         # Индекс по категориям: category -> [disease_ids]
         self.category_index: Dict[str, set] = defaultdict(set)
+        
+        # IDF registry для неожиданных паттернов
+        self.idf_registry: Dict[str, float] = {}
     
     def load_diseases_from_json(self, json_path: str):
         """Загрузка заболеваний из JSON"""
@@ -464,8 +714,22 @@ class DiseaseSearchEngine:
         for disease in diseases_list:
             self.diseases[disease.disease_id] = disease
             self._index_disease(disease)
+            
+            # Заполняем IDF registry
+            for pattern in disease.patterns:
+                test_info = self.reference_manager.find_test(pattern.test_name)
+                if test_info:
+                    _, test_data = test_info
+                    canonical_name = test_data['test_name']
+                else:
+                    canonical_name = pattern.test_name
+                
+                pattern_key = self._make_pattern_key(canonical_name, pattern.expected_status)
+                if pattern_key not in self.idf_registry:
+                    self.idf_registry[pattern_key] = pattern.idf_weight
         
         print(f"✓ Loaded {len(self.diseases)} diseases into search engine")
+        print(f"✓ Built IDF registry with {len(self.idf_registry)} patterns")
     
     def _index_disease(self, disease: Disease):
         """Построение индексов для заболевания"""
@@ -501,13 +765,13 @@ class DiseaseSearchEngine:
         apply_contradiction_penalty: bool = True
     ) -> List[SearchResult]:
         """
-        Поиск заболеваний по результатам анализов пациента
+        Поиск заболеваний по результатам анализов пациента с непрерывным скорингом
         
         Args:
             patient_tests: Список результатов анализов
             top_k: Количество результатов
             gender: Пол пациента ('male', 'female', 'unisex')
-            categories: Фильтр по категориям (None = все категории)
+            categories: Фильтр по категориям анализов
             min_matched_patterns: Минимум совпадений для включения в результаты
             apply_contradiction_penalty: Применять ли штраф за противоречия
         
@@ -515,7 +779,7 @@ class DiseaseSearchEngine:
             Список результатов, отсортированный по релевантности
         """
         # 1. Определяем статусы для всех тестов пациента
-        patient_patterns: Dict[str, Tuple[str, str, str]] = {}  # normalized_name -> (status, category, canonical_name)
+        patient_patterns: Dict[str, Dict] = {}
         
         for test in patient_tests:
             status = self.reference_manager.calculate_status(
@@ -583,20 +847,38 @@ class DiseaseSearchEngine:
                     if categories and pattern_category not in categories:
                         continue
                     
-                    # Это совпадение!
-                    disease_scores[disease_id]['matched_score'] += idf_weight
+                    # Вычисляем непрерывную дистанцию
+                    dist, _ = self.reference_manager.distance_from_normal(
+                        canonical_name,
+                        patient_info['value'],
+                        gender,
+                        patient_info['units']
+                    )
+                    
+                    # Базовое совпадение с учетом дистанции
+                    mult = 1.0  # полное совпадение
+                    gain = continuous_contribution(idf_weight, mult, dist)
+                    
+                    disease_scores[disease_id]['matched_score'] += gain
                     disease_scores[disease_id]['matched_patterns'].append({
                         'test_name': canonical_name,
                         'status': status,
                         'idf_weight': idf_weight,
-                        'category': pattern_category
+                        'category': pattern_category,
+                        'dist': dist,
+                        'gain': gain
                     })
         
-        # 3. Проверяем противоречия (только для найденных заболеваний)
+        # 3. Проверяем противоречия и missing data (только для найденных заболеваний)
         for disease_id in disease_scores.keys():
             disease = self.diseases[disease_id]
+            
+            # Получаем категории болезни
+            disease_cats = disease_categories_from_patterns(disease.patterns)
+            
             expected_entries = []
             pattern_name_map = {}
+            unexpected_penalties = []
 
             for pattern in disease.patterns:
                 # Находим каноническое название
@@ -615,6 +897,7 @@ class DiseaseSearchEngine:
                     'category': pattern.category,
                     'canonical_name': canonical_name
                 }
+                
                 expected_entries.append({
                     'test_name': canonical_name,
                     'expected_status': pattern.expected_status,
@@ -628,20 +911,45 @@ class DiseaseSearchEngine:
                     patient_status = patient_info['status']
                     expected_status = pattern.expected_status
                     
-                    # Противоречие?
-                    if patient_status != expected_status:
-                        if apply_contradiction_penalty:
-                            disease_scores[disease_id]['contradiction_penalty'] += pattern.idf_weight
+                    # Если паттерн уже совпал (найден через индекс), пропускаем
+                    if patient_status == expected_status:
+                        continue
+                    
+                    # Статусы НЕ совпадают - это всегда штраф
+                    # Вопрос только в силе штрафа
+                    dist, _ = self.reference_manager.distance_from_normal(
+                        canonical_name,
+                        patient_info['value'],
+                        gender,
+                        patient_info['units']
+                    )
+                    
+                    mult = severity_multiplier(expected_status, patient_status)
+                    
+                    if apply_contradiction_penalty:
+                        if mult > 0:
+                            # Направление совпадает, но тяжесть разная
+                            # (expected: above_normal, actual: critically_high)
+                            # Это меньший штраф - 40% от полного
+                            penalty_multiplier = 0.4
+                        else:
+                            # Направление противоположное или ожидалась норма
+                            # Полный штраф
+                            penalty_multiplier = 1.0
+                        
+                        pen = continuous_penalty(pattern.idf_weight, penalty_multiplier, dist)
+                        disease_scores[disease_id]['contradiction_penalty'] += pen
                         
                         disease_scores[disease_id]['contradictions'].append({
                             'test_name': canonical_name,
                             'expected': expected_status,
                             'actual': patient_status,
-                            'penalty': pattern.idf_weight,
+                            'penalty': pen,
                             'category': pattern.category,
-                            'reason': 'pattern_mismatch',
+                            'reason': 'severity_mismatch' if mult > 0 else 'direction_mismatch',
                             'user_value': patient_info['value'],
-                            'units': patient_info['units'] if patient_info['units'] else ''
+                            'units': patient_info['units'] if patient_info['units'] else '',
+                            'dist': dist
                         })
                 else:
                     # Отсутствующие данные
@@ -655,47 +963,95 @@ class DiseaseSearchEngine:
 
             disease_scores[disease_id]['expected_patterns'] = expected_entries
 
-            allowed_categories = set(categories) if categories else None
+            # Обработка неожиданных отклонений (не в паттерне болезни)
             pattern_name_set = set(pattern_name_map.keys())
 
+            # Считаем default penalty
             pattern_weights = [entry['idf_weight'] for entry in expected_entries if entry.get('idf_weight') is not None]
             default_penalty = (sum(pattern_weights) / len(pattern_weights)) if pattern_weights else 0.0
 
             for normalized_name, patient_info in patient_patterns.items():
+                # Пропускаем тесты, которые уже в паттерне
                 if normalized_name in pattern_name_set:
                     continue
-                if allowed_categories and patient_info['category'] not in allowed_categories:
+                
+                # Фильтруем по категориям болезни
+                if patient_info['category'] not in disease_cats:
                     continue
 
-                status = patient_info['status']
+                actual_status = patient_info['status']
                 canonical_name = patient_info['canonical_name']
                 user_value = patient_info['value']
                 units = patient_info['units'] if patient_info['units'] else ''
                 category = patient_info['category']
 
-                if status == 'normal':
+                if actual_status == 'normal':
+                    # Нормальные значения не штрафуем
                     disease_scores[disease_id]['redundant_data'].append({
                         'test_name': canonical_name,
-                        'actual_status': status,
+                        'actual_status': actual_status,
                         'user_value': user_value,
                         'units': units,
-                        'reason': 'not_in_pattern'
+                        'reason': 'normal_outside_pattern'
                     })
-                else:
-                    penalty = default_penalty if status != 'unknown' else 0.0
-                    if apply_contradiction_penalty and penalty:
-                        disease_scores[disease_id]['contradiction_penalty'] += penalty
+                    continue
 
-                    disease_scores[disease_id]['contradictions'].append({
-                        'test_name': canonical_name,
-                        'expected': 'normal',
-                        'actual': status,
-                        'penalty': penalty,
-                        'category': category,
-                        'reason': 'not_in_pattern',
-                        'user_value': user_value,
-                        'units': units
-                    })
+                # Вычисляем непрерывную дистанцию
+                dist, _ = self.reference_manager.distance_from_normal(
+                    canonical_name,
+                    user_value,
+                    gender,
+                    units
+                )
+
+                # Пытаемся взять IDF из registry
+                pattern_key = self._make_pattern_key(canonical_name, actual_status)
+                idf_for_unexpected = self.idf_registry.get(pattern_key, default_penalty)
+
+                # Множитель: ожидали норму, получили отклонение
+                mult = severity_multiplier('normal', actual_status)
+                pen = continuous_penalty(idf_for_unexpected, mult, dist)
+
+                unexpected_penalties.append({
+                    'test_name': canonical_name,
+                    'actual_status': actual_status,
+                    'user_value': user_value,
+                    'units': units,
+                    'category': category,
+                    'dist': dist,
+                    'idf_weight': idf_for_unexpected,
+                    'penalty': pen,
+                    'reason': 'not_in_pattern_same_category'
+                })
+
+            # Агрегируем неожиданные штрафы
+            if unexpected_penalties and apply_contradiction_penalty:
+                agg_unexp = aggregate_unexpected_penalties(
+                    unexpected_penalties,
+                    max_m=SCORING.TOP_M_UNEXPECTED,
+                    use_rms=SCORING.USE_RMS_FOR_UNEXPECTED
+                )
+                if agg_unexp > 0:
+                    disease_scores[disease_id]['contradiction_penalty'] += agg_unexp
+                    # Добавляем top-M в contradictions для объяснения
+                    top_unexpected = sorted(
+                        unexpected_penalties,
+                        key=lambda x: x['penalty'],
+                        reverse=True
+                    )[:SCORING.TOP_M_UNEXPECTED]
+                    
+                    for unexp in top_unexpected:
+                        disease_scores[disease_id]['contradictions'].append({
+                            'test_name': unexp['test_name'],
+                            'expected': 'normal',
+                            'actual': unexp['actual_status'],
+                            'penalty': unexp['penalty'],
+                            'category': unexp['category'],
+                            'reason': unexp['reason'],
+                            'user_value': unexp['user_value'],
+                            'units': unexp['units'],
+                            'dist': unexp.get('dist', 0.0)
+                        })
         
         # 4. Финальный скоринг и формирование результатов
         results = []
@@ -708,8 +1064,14 @@ class DiseaseSearchEngine:
             
             matched_score = scores['matched_score']
             contradiction_penalty = scores['contradiction_penalty']
-            total_score = matched_score - contradiction_penalty
+            
+            # Применяем cap на штрафы
             max_score = disease.max_idf_score
+            if max_score > 0:
+                cap = SCORING.CONTRADICTION_CAP_FRAC * max_score
+                contradiction_penalty = min(contradiction_penalty, cap)
+            
+            total_score = matched_score - contradiction_penalty
             
             result = SearchResult(
                 disease_id=disease_id,
@@ -785,7 +1147,7 @@ class MedicalLabAnalyzer:
         self.search_engine = DiseaseSearchEngine(self.reference_manager)
         self.search_engine.load_diseases_from_json(diseases_path)
         print("=" * 60)
-    
+
     def analyze_patient(
         self,
         tests: List[Dict],
@@ -830,7 +1192,6 @@ class MedicalLabAnalyzer:
         
         return results
     
-
     def explain_tests(
         self,
         tests: List[Dict],
@@ -969,7 +1330,6 @@ class MedicalLabAnalyzer:
             return "N/A"
         return f"{value:.6g}"
 
-
     def print_results(self, results: List[SearchResult], detailed: bool = False):
         """Красивый вывод результатов"""
         if not results:
@@ -994,14 +1354,17 @@ class MedicalLabAnalyzer:
                 if result.matched_details:
                     print("\n  ✅ Matched Patterns:")
                     for match in result.matched_details:
+                        dist = match.get('dist', 0.0)
+                        gain = match.get('gain', 0.0)
                         print(f"     • {match['test_name']}: {match['status']} "
-                              f"(IDF: {match['idf_weight']:.4f}, Category: {match['category']})")
+                              f"(IDF: {match['idf_weight']:.4f}, Dist: {dist:.3f}, Gain: {gain:.4f})")
                 
                 if result.contradictions:
                     print("\n  ⚠️  Contradictions:")
                     for contra in result.contradictions:
+                        dist = contra.get('dist', 0.0)
                         print(f"     • {contra['test_name']}: expected {contra['expected']}, "
-                              f"got {contra['actual']} (Penalty: {contra['penalty']:.4f})")
+                              f"got {contra['actual']} (Penalty: {contra['penalty']:.4f}, Dist: {dist:.3f})")
                 
                 if result.missing_data and len(result.missing_data) <= 5:
                     print("\n  ❓ Missing Tests (top 5):")
@@ -1092,8 +1455,7 @@ class MedicalLabAnalyzer:
         pattern_weight_docs = list(weights_collection.find({}))
         pattern_weights = {doc['pattern_key']: doc for doc in pattern_weight_docs}
 
-        print(f'? Loaded {len(pattern_weight_docs)} pattern weight entries')
-
+        print(f'✓ Loaded {len(pattern_weight_docs)} pattern weight entries')
         
         # Получаем все документы
         documents = list(collection.find({}))
@@ -1136,9 +1498,23 @@ class MedicalLabAnalyzer:
             # Сохраняем и индексируем
             self.search_engine.diseases[disease.disease_id] = disease
             self.search_engine._index_disease(disease)
+            
+            # Заполняем IDF registry
+            for pattern in disease.patterns:
+                test_info = self.reference_manager.find_test(pattern.test_name)
+                if test_info:
+                    _, test_data = test_info
+                    canonical_name = test_data['test_name']
+                else:
+                    canonical_name = pattern.test_name
+                
+                pattern_key = self.search_engine._make_pattern_key(canonical_name, pattern.expected_status)
+                if pattern_key not in self.search_engine.idf_registry:
+                    self.search_engine.idf_registry[pattern_key] = pattern.idf_weight
         
         print(f"✓ Loaded {len(self.search_engine.diseases)} diseases")
         print(f"✓ Built inverted index with {len(self.search_engine.pattern_index)} patterns")
+        print(f"✓ Built IDF registry with {len(self.search_engine.idf_registry)} patterns")
         
         # Показываем метаданные IDF
         metadata = db.metadata.find_one({"data_type": "idf_weights"})
