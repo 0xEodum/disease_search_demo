@@ -16,7 +16,7 @@ import asyncio
 
 app = FastAPI(
     title="Medical Lab Disease Search API with MongoDB",
-    description="РџРѕРёСЃРє Р·Р°Р±РѕР»РµРІР°РЅРёР№ РїРѕ Р»Р°Р±РѕСЂР°С‚РѕСЂРЅС‹Рј Р°РЅР°Р»РёР·Р°Рј (JSON + MongoDB)",
+    description="(JSON + MongoDB)",
     version="2.0.0"
 )
 
@@ -29,25 +29,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================
-# Р“Р»РѕР±Р°Р»СЊРЅРѕРµ СЃРѕСЃС‚РѕСЏРЅРёРµ
-# ============================================================
 
 analyzer: Optional[MedicalLabAnalyzer] = None
 sync_manager: Optional[SyncManager] = None
 mongodb_client: Optional[MongoClient] = None
 startup_time = time.time()
 
-# РљРѕРЅС„РёРіСѓСЂР°С†РёСЏ РёР· РїРµСЂРµРјРµРЅРЅС‹С… РѕРєСЂСѓР¶РµРЅРёСЏ
 USE_MONGODB = "true"
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB = os.getenv("MONGODB_DB", "medical_lab")
 SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "3600"))
 
-
-# ============================================================
-# РњРѕРґРµР»Рё РґР°РЅРЅС‹С…
-# ============================================================
 
 class TestInput(BaseModel):
     name: str = Field(..., description="РќР°Р·РІР°РЅРёРµ С‚РµСЃС‚Р°")
@@ -85,10 +77,6 @@ class AnalysisResponse(BaseModel):
     results: List[DiseaseResult]
     total_found: int
     data_source: str
-
-
-
-
 
 class TestExplanationRequest(BaseModel):
     tests: List[TestInput]
@@ -138,11 +126,10 @@ class SyncStatusResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    """РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ РїСЂРё СЃС‚Р°СЂС‚Рµ"""
     global analyzer, sync_manager, mongodb_client
     
     print("=" * 60)
-    print("рџљЂ Starting Medical Lab API v2.0")
+    print("Starting Medical Lab API v2.0")
     print("=" * 60)
     print(f"  Data source: {'MongoDB' if USE_MONGODB else 'JSON files'}")
     
@@ -155,29 +142,23 @@ async def startup():
     
     try:
         if USE_MONGODB:
-            # MongoDB СЂРµР¶РёРј
             mongodb_client = MongoClient(MONGODB_URI)
-            
-            # РџСЂРѕРІРµСЂРєР° РїРѕРґРєР»СЋС‡РµРЅРёСЏ
+
             mongodb_client.admin.command('ping')
             print("вњ“ Connected to MongoDB")
-            
-            # РЎРѕР·РґР°С‘Рј Р°РЅР°Р»РёР·Р°С‚РѕСЂ СЃ MongoDB РєР»РёРµРЅС‚РѕРј
+
             analyzer = MedicalLabAnalyzer(mongodb_client=mongodb_client)
-            
-            # РЎРѕР·РґР°С‘Рј РјРµРЅРµРґР¶РµСЂ СЃРёРЅС…СЂРѕРЅРёР·Р°С†РёРё
+
             sync_manager = SyncManager(
                 analyzer=analyzer,
                 mongodb_client=mongodb_client,
                 db_name=MONGODB_DB,
                 check_interval=SYNC_INTERVAL
             )
-            
-            # Р—Р°РїСѓСЃРєР°РµРј С„РѕРЅРѕРІСѓСЋ СЃРёРЅС…СЂРѕРЅРёР·Р°С†РёСЋ
+
             asyncio.create_task(sync_manager.start())
             
         else:
-            # JSON С„Р°Р№Р»С‹ СЂРµР¶РёРј
             analyzer = MedicalLabAnalyzer()
             analyzer.load_references('ref_blood.json')
             analyzer.load_diseases('diseases.json')
@@ -192,7 +173,6 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    """РћС‡РёСЃС‚РєР° РїСЂРё РѕСЃС‚Р°РЅРѕРІРєРµ"""
     print("\nрџ‘‹ Shutting down...")
     
     if sync_manager:
@@ -201,10 +181,6 @@ async def shutdown():
     if mongodb_client:
         mongodb_client.close()
 
-
-# ============================================================
-# Р­РЅРґРїРѕРёРЅС‚С‹
-# ============================================================
 
 @app.get("/", tags=["Health"])
 async def root():
@@ -218,7 +194,6 @@ async def root():
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
-    """РџСЂРѕРІРµСЂРєР° Р·РґРѕСЂРѕРІСЊСЏ СЃРµСЂРІРёСЃР°"""
     uptime = time.time() - startup_time
     
     # Sync status
@@ -238,7 +213,6 @@ async def health_check():
 
 @app.post("/api/analyze", response_model=AnalysisResponse, tags=["Analysis"])
 async def analyze_tests(request: AnalysisRequest):
-    """РђРЅР°Р»РёР· Р»Р°Р±РѕСЂР°С‚РѕСЂРЅС‹С… С‚РµСЃС‚РѕРІ"""
     if not analyzer or not analyzer.search_engine:
         raise HTTPException(
             status_code=503,
@@ -294,13 +268,9 @@ async def analyze_tests(request: AnalysisRequest):
             }
         )
 
-
-
-
-
 @app.post("/api/tests/explanations", response_model=TestExplanationResponse, tags=["Analysis"])
 async def explain_user_data(request: TestExplanationRequest):
-    '''Return explanation details for each provided laboratory test.'''
+    """Return explanation details for each provided laboratory test."""
     if not analyzer or not analyzer.reference_manager:
         raise HTTPException(
             status_code=503,
@@ -341,7 +311,6 @@ async def explain_user_data(request: TestExplanationRequest):
 
 @app.get("/api/sync/status", response_model=SyncStatusResponse, tags=["Sync"])
 async def get_sync_status():
-    """РЎС‚Р°С‚СѓСЃ СЃРёРЅС…СЂРѕРЅРёР·Р°С†РёРё (С‚РѕР»СЊРєРѕ РґР»СЏ MongoDB СЂРµР¶РёРјР°)"""
     if not USE_MONGODB or not sync_manager:
         return SyncStatusResponse(
             enabled=False,
@@ -358,7 +327,6 @@ async def get_sync_status():
 
 @app.post("/api/sync/force", tags=["Sync"])
 async def force_sync():
-    """РџСЂРёРЅСѓРґРёС‚РµР»СЊРЅР°СЏ СЃРёРЅС…СЂРѕРЅРёР·Р°С†РёСЏ (С‚РѕР»СЊРєРѕ РґР»СЏ MongoDB)"""
     if not USE_MONGODB or not sync_manager:
         raise HTTPException(
             status_code=400,
@@ -383,7 +351,6 @@ async def force_sync():
 
 @app.post("/api/reload", tags=["Admin"])
 async def reload_data():
-    """РџРµСЂРµР·Р°РіСЂСѓР·РєР° РґР°РЅРЅС‹С… (РґР»СЏ JSON СЂРµР¶РёРјР°)"""
     if USE_MONGODB:
         raise HTTPException(
             status_code=400,
@@ -412,16 +379,14 @@ async def reload_data():
 
 @app.get("/api/diseases", tags=["Info"])
 async def list_diseases(
-    category: Optional[str] = Query(None, description="Р¤РёР»СЊС‚СЂ РїРѕ РєР°С‚РµРіРѕСЂРёРё")
+    category: Optional[str] = Query(None, description="")
 ):
-    """РЎРїРёСЃРѕРє Р·Р°Р±РѕР»РµРІР°РЅРёР№"""
     if not analyzer or not analyzer.search_engine:
         raise HTTPException(status_code=503, detail="Search engine not initialized")
     
     diseases = []
     
     for disease in analyzer.search_engine.diseases.values():
-        # Р¤РёР»СЊС‚СЂ РїРѕ РєР°С‚РµРіРѕСЂРёРё
         if category:
             categories = set(p.category for p in disease.patterns)
             if category not in categories:
@@ -442,8 +407,7 @@ async def list_diseases(
 
 
 @app.get("/api/tests", tags=["Info"])
-async def list_tests(category: Optional[str] = Query(None, description="Р¤РёР»СЊС‚СЂ РїРѕ РєР°С‚РµРіРѕСЂРёРё")):
-    """РЎРїРёСЃРѕРє РґРѕСЃС‚СѓРїРЅС‹С… С‚РµСЃС‚РѕРІ"""
+async def list_tests(category: Optional[str] = Query(None, description="")):
     if not analyzer or not analyzer.reference_manager:
         raise HTTPException(status_code=503, detail="Reference manager not initialized")
     
@@ -467,35 +431,9 @@ async def list_tests(category: Optional[str] = Query(None, description="Р¤Рё
     }
 
 
-# ============================================================
-# Р—Р°РїСѓСЃРє
-# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
-    
-    print("""
-    в•”в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•—
-    в•‘   Medical Lab Disease Search API v2.0                  в•‘
-    в•‘   With MongoDB Integration                             в•‘
-    в•љв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ќ
-    
-    Environment Variables:
-      USE_MONGODB=true/false     - Enable MongoDB (default: false)
-      MONGODB_URI=...            - MongoDB connection string
-      MONGODB_DB=medical_lab     - Database name
-      SYNC_INTERVAL=3600         - Sync interval in seconds
-    
-    Examples:
-      # JSON mode (default)
-      python api_mongodb.py
-      
-      # MongoDB mode
-      USE_MONGODB=true python api_mongodb.py
-      
-      # Custom MongoDB settings
-      USE_MONGODB=true MONGODB_URI=mongodb://user:pass@host:27017 python api_mongodb.py
-    """)
     
     uvicorn.run(
         "api_mongodb:app",

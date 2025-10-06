@@ -1,6 +1,7 @@
 ﻿"""
 Medical Lab Disease Search Engine
 Поисковый движок для определения заболеваний по лабораторным анализам
+Version 2.0 - Improved continuous scoring with bell-shaped distribution
 """
 
 import json
@@ -151,7 +152,7 @@ class Disease:
     canonical_name: str
     patterns: List[Pattern] = field(default_factory=list)
     max_idf_score: float = 0.0
-    
+
     def calculate_max_score(self):
         """Расчёт максимального возможного скора"""
         self.max_idf_score = sum(p.idf_weight for p in self.patterns)
@@ -178,53 +179,53 @@ class SearchResult:
 
 class ReferenceRangeManager:
     """Управление референсными диапазонами"""
-    
+
     def __init__(self):
         self.references: Dict[str, Dict] = {}
         # Индекс: normalized_name -> (category, original_name)
         self.name_index: Dict[str, Tuple[str, str]] = {}
         self.unit_converter = UnitConverter()
-    
+
     def load_from_json(self, json_path: str):
         """Загрузка референсов из JSON"""
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
         ref_ranges = data.get('reference_ranges', {})
-        
+
         for category, tests in ref_ranges.items():
             if category not in self.references:
                 self.references[category] = {}
-            
+
             for test in tests:
                 test_name = test['test_name']
                 self.references[category][test_name] = test
-                
+
                 # Индексируем основное имя
                 norm_name = self._normalize(test_name)
                 self.name_index[norm_name] = (category, test_name)
-                
+
                 # Индексируем альтернативные имена
                 for alt_name in test.get('alt_names', []):
                     norm_alt = self._normalize(alt_name)
                     self.name_index[norm_alt] = (category, test_name)
-        
+
         print(f"✓ Loaded {sum(len(tests) for tests in self.references.values())} reference ranges")
         print(f"✓ Built name index with {len(self.name_index)} entries")
-    
+
     def find_test(self, test_name: str) -> Optional[Tuple[str, Dict]]:
         """
         Поиск теста по имени (включая альтернативные названия)
         Возвращает: (category, test_data) или None
         """
         norm_name = self._normalize(test_name)
-        
+
         if norm_name in self.name_index:
             category, original_name = self.name_index[norm_name]
             return category, self.references[category][original_name]
-        
+
         return None
-    
+
     def calculate_status(
         self,
         test_name: str,
@@ -239,12 +240,12 @@ class ReferenceRangeManager:
         test_info = self.find_test(test_name)
         if not test_info:
             return 'unknown'
-        
+
         _, test_data = test_info
         # Convert patient measurement to reference units when possible
         target_units = test_data.get('units')
         value = self.unit_converter.convert(value, units, target_units)
-        
+
         # ПРИОРИТЕТ 1: Абсолютные диапазоны статусов
         status_ranges = test_data.get('status_ranges', {})
         if status_ranges:
@@ -256,41 +257,41 @@ class ReferenceRangeManager:
             else:
                 # Берём первый доступный
                 ranges = next(iter(status_ranges.values()))
-            
+
             # Проверяем критически низкий
             if 'critically_low' in ranges:
                 if 'max' in ranges['critically_low'] and value <= ranges['critically_low']['max']:
                     return 'critically_low'
-            
+
             # Проверяем ниже нормы
             if 'below_normal' in ranges:
                 rng = ranges['below_normal']
                 if 'min' in rng and 'max' in rng:
                     if rng['min'] <= value < rng['max']:
                         return 'below_normal'
-            
+
             # Проверяем норму
             if 'normal' in ranges:
                 rng = ranges['normal']
                 if 'min' in rng and 'max' in rng:
                     if rng['min'] <= value <= rng['max']:
                         return 'normal'
-            
+
             # Проверяем выше нормы
             if 'above_normal' in ranges:
                 rng = ranges['above_normal']
                 if 'min' in rng and 'max' in rng:
                     if rng['min'] < value <= rng['max']:
                         return 'above_normal'
-            
+
             # Проверяем критически высокий
             if 'critically_high' in ranges:
                 if 'min' in ranges['critically_high'] and value >= ranges['critically_high']['min']:
                     return 'critically_high'
-        
+
         # ПРИОРИТЕТ 2: Процентные пороги от нормального диапазона
         normal_range = test_data.get('normal_range', {})
-        
+
         # Определяем диапазон по полу
         if isinstance(normal_range, dict):
             if gender in normal_range:
@@ -303,44 +304,44 @@ class ReferenceRangeManager:
                 range_data = next(iter(normal_range.values()), {})
         else:
             return 'unknown'
-        
+
         min_val = range_data.get('min')
         max_val = range_data.get('max')
-        
+
         if min_val is None or max_val is None:
             return 'unknown'
-        
+
         # Пороги отклонений
         thresholds = test_data.get('deviation_thresholds', {})
         mild_pct = thresholds.get('mild_deviation_pct', 10)
         significant_pct = thresholds.get('significant_deviation_pct', 30)
-        
+
         # Проверка нормы
         if min_val <= value <= max_val:
             return 'normal'
-        
+
         # Ниже нормы
         if value < min_val:
             deviation_pct = ((min_val - value) / min_val) * 100
-            
+
             if deviation_pct <= mild_pct:
                 return 'normal'
             elif deviation_pct <= significant_pct:
                 return 'below_normal'
             else:
                 return 'critically_low'
-        
+
         # Выше нормы
         if value > max_val:
             deviation_pct = ((value - max_val) / max_val) * 100
-            
+
             if deviation_pct <= mild_pct:
                 return 'normal'
             elif deviation_pct <= significant_pct:
                 return 'above_normal'
             else:
                 return 'critically_high'
-        
+
         return 'unknown'
 
     def distance_from_normal(
@@ -443,7 +444,7 @@ class ReferenceRangeManager:
 
 class IDFCalculator:
     """Расчёт IDF весов для паттернов"""
-    
+
     @staticmethod
     def calculate_idf_weights(diseases: List[Disease]) -> None:
         """
@@ -451,13 +452,13 @@ class IDFCalculator:
         Изменяет объекты Disease in-place
         """
         total_diseases = len(diseases)
-        
+
         if total_diseases == 0:
             return
-        
+
         # Подсчёт document frequency для каждого паттерна
         pattern_df: Dict[str, int] = defaultdict(int)
-        
+
         for disease in diseases:
             # Уникальные паттерны в заболевании
             unique_patterns = set()
@@ -467,11 +468,11 @@ class IDFCalculator:
                     pattern.expected_status
                 )
                 unique_patterns.add(pattern_key)
-            
+
             # Увеличиваем DF для каждого уникального паттерна
             for pattern_key in unique_patterns:
                 pattern_df[pattern_key] += 1
-        
+
         # Расчёт IDF для каждого паттерна
         for disease in diseases:
             for pattern in disease.patterns:
@@ -480,20 +481,20 @@ class IDFCalculator:
                     pattern.expected_status
                 )
                 df = pattern_df[pattern_key]
-                
+
                 # IDF = ln((N + 1) / (DF + 1))
                 pattern.idf_weight = math.log((total_diseases + 1) / (df + 1))
-            
+
             # Пересчитываем максимальный скор
             disease.calculate_max_score()
-        
+
         print(f"✓ Calculated IDF weights for {len(pattern_df)} unique patterns")
         print(f"  Total diseases: {total_diseases}")
         avg_idf = sum(
             p.idf_weight for d in diseases for p in d.patterns
         ) / sum(len(d.patterns) for d in diseases)
         print(f"  Average IDF weight: {avg_idf:.4f}")
-    
+
     @staticmethod
     def _make_pattern_key(test_name: str, status: str) -> str:
         """Создание ключа паттерна"""
@@ -504,8 +505,10 @@ class IDFCalculator:
 # ── Конфигурация скоринга ─────────────────────────────────────────────────────
 @dataclass
 class ScoringConfig:
-    # насыщение нелинейности по дистанции: dist/D0 → [0..1]
+    # насыщение нелинейности по дистанции для критических зон
     D0: float = 0.30
+    # максимальный кап для экспоненциального насыщения (чтобы не требовать бесконечность)
+    MAX_SATURATION: float = 0.95
     # сколько «неожиданных» штрафов учитывать максимум на болезнь
     TOP_M_UNEXPECTED: int = 7
     # сглаживание суммы штрафов: sqrt(sum(p_i^2))
@@ -514,6 +517,130 @@ class ScoringConfig:
     CONTRADICTION_CAP_FRAC: float = 0.6
 
 SCORING = ScoringConfig()
+
+
+# ── Новая функция для вычисления вклада в зависимости от положения в интервале ──
+def distance_contribution(
+    value: float,
+    status: str,
+    test_data: dict,
+    gender: str,
+    D0: Optional[float] = None,
+    max_saturation: Optional[float] = None
+) -> float:
+    """
+    Вычисляет вклад [0..1] в зависимости от положения внутри статусного диапазона.
+
+    Логика:
+    - Для above_normal/below_normal: колоколообразная функция с максимумом в центре диапазона
+      (1 - deviation_from_center²), где deviation_from_center ∈ [0, 1]
+    - Для critically_high/critically_low: экспоненциальное насыщение с ограничением
+      (1 - exp(-dist/D0)), ограниченное max_saturation
+    - Для normal: всегда 0 (нет бонуса за "хорошую норму")
+
+    Args:
+        value: значение теста пациента
+        status: статус теста ('normal', 'above_normal', 'below_normal', 'critically_high', 'critically_low')
+        test_data: данные теста из reference_ranges
+        gender: пол пациента
+        D0: параметр насыщения для экспоненты (по умолчанию из SCORING)
+        max_saturation: максимальное значение насыщения (по умолчанию из SCORING)
+
+    Returns:
+        float в диапазоне [0, max_saturation] для критических или [0, 1] для остальных
+    """
+    if D0 is None:
+        D0 = SCORING.D0
+    if max_saturation is None:
+        max_saturation = SCORING.MAX_SATURATION
+
+    if status == 'normal':
+        return 0.0
+
+    # Получаем границы статуса
+    status_ranges = test_data.get('status_ranges', {})
+    if status_ranges:
+        ranges = status_ranges.get(gender) or status_ranges.get('unisex') or next(iter(status_ranges.values()))
+        status_range = ranges.get(status) if isinstance(ranges, dict) else None
+    else:
+        status_range = None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Для critically_high/critically_low - экспоненциальное насыщение
+    # ═══════════════════════════════════════════════════════════════════════════
+    if status in ('critically_high', 'critically_low'):
+        if not status_range:
+            return 0.5  # fallback
+
+        if status == 'critically_high':
+            boundary = status_range.get('min')
+            if boundary is None:
+                return 0.5
+            # Дистанция за границу критической зоны
+            if boundary == 0:
+                dist = 0.0
+            else:
+                dist = max(0.0, (value - boundary) / abs(boundary))
+            # Насыщение с ограничением
+            contribution = 1.0 - math.exp(-dist / D0)
+            return min(max_saturation, contribution)
+
+        else:  # critically_low
+            boundary = status_range.get('max')
+            if boundary is None:
+                return 0.5
+            if boundary == 0:
+                dist = 0.0
+            else:
+                dist = max(0.0, (boundary - value) / abs(boundary))
+            contribution = 1.0 - math.exp(-dist / D0)
+            return min(max_saturation, contribution)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Для above_normal/below_normal - колокол с максимумом в центре
+    # ═══════════════════════════════════════════════════════════════════════════
+    if status in ('above_normal', 'below_normal'):
+        if not status_range or 'min' not in status_range or 'max' not in status_range:
+            # Fallback на старую логику (экспоненциальное насыщение от границы нормы)
+            normal_range = test_data.get('normal_range', {})
+            if isinstance(normal_range, dict):
+                # Определяем референсный диапазон
+                if 'min' in normal_range and 'max' in normal_range:
+                    ref = normal_range
+                else:
+                    ref = normal_range.get(gender) or normal_range.get('unisex')
+
+                if ref and 'min' in ref and 'max' in ref:
+                    if status == 'above_normal':
+                        boundary = ref.get('max')
+                    else:  # below_normal
+                        boundary = ref.get('min')
+
+                    if boundary is not None and boundary != 0:
+                        dist = abs(value - boundary) / abs(boundary)
+                        contribution = 1.0 - math.exp(-dist / D0)
+                        return min(max_saturation, contribution)
+            return 0.5  # полный fallback
+
+        range_min = status_range['min']
+        range_max = status_range['max']
+        range_center = (range_min + range_max) / 2.0
+        range_width = range_max - range_min
+
+        if range_width == 0:
+            return 0.5
+
+        # Нормализованное отклонение от центра: [0..1]
+        # 0 = в центре, 1 = на границе интервала
+        deviation_from_center = abs(value - range_center) / (range_width / 2.0)
+        deviation_from_center = min(1.0, max(0.0, deviation_from_center))
+
+        # Колоколообразная функция: 1 - x²
+        # В центре = 1.0, на краях = 0.0
+        contribution = 1.0 - (deviation_from_center ** 2)
+        return max(0.0, contribution)
+
+    return 0.5  # fallback для неизвестных статусов
 
 
 # ── Функции тяжести и нелинейности ─────────────────────────────────────────────
@@ -570,59 +697,147 @@ def severity_multiplier(expected: str, actual: str) -> float:
         return -1.0 if (se == 1 and sa == 1) else -1.5
 
 
-def distance_gain(dist: float, D0: Optional[float] = None) -> float:
-    """
-    Преобразует «на сколько вышли за норму» в [0..1].
-    Используем сглаживание: g = 1 - exp(-dist / D0), где D0~0.3 по умолчанию.
-    """
-    if D0 is None:
-        D0 = SCORING.D0
-    if dist <= 0:
-        return 0.0
-    # мягкая сатурация
-    g = 1.0 - math.exp(-float(dist) / float(D0))
-    # для очень больших dist ограничим 1.0
-    return 1.0 if g > 1.0 else float(g)
-
-
-def continuous_contribution(idf_weight: float, mult: float, dist: float) -> float:
+def continuous_contribution(
+    idf_weight: float,
+    mult: float,
+    value: float,
+    status: str,
+    test_data: dict,
+    gender: str
+) -> float:
     """
     Вклад (положительный), когда ожидаемое совпало по направлению.
     mult — выход severity_multiplier (ожидаем >0).
-    
-    Гибридная формула:
+
+    Гибридная формула с улучшенной логикой:
     - Базовый вклад 70% IDF за совпадение статуса
-    - Бонус 30% IDF × distance_gain за величину отклонения
-    
+    - Бонус 30% IDF × distance_contribution за положение в интервале
+
     Это даёт:
-    - Минимум 70% IDF при совпадении статуса (даже если dist мал)
-    - До 100% IDF при больших отклонениях
+    - Для above_normal/below_normal: максимум в центре диапазона
+    - Для critically_high/low: экспоненциальный рост с насыщением
+    - Минимум 70% IDF при совпадении статуса
+    - До 100% IDF при оптимальном положении/больших отклонениях
     """
     if idf_weight is None or idf_weight <= 0:
         return 0.0
-    
+
     if mult <= 0:
         return 0.0
-    
+
     # Базовый вклад за совпадение статуса (70% от IDF)
     base_contribution = 0.7 * float(idf_weight) * float(mult)
-    
-    # Бонус за величину отклонения (до 30% от IDF)
-    g = distance_gain(dist)
-    distance_bonus = 0.3 * float(idf_weight) * float(mult) * g
-    
+
+    # Бонус за положение в интервале (до 30% от IDF)
+    contrib = distance_contribution(value, status, test_data, gender)
+    distance_bonus = 0.3 * float(idf_weight) * float(mult) * contrib
+
     return base_contribution + distance_bonus
 
 
-def continuous_penalty(idf_weight: float, mult: float, dist: float) -> float:
+def distance_penalty_contribution(
+    value: float,
+    status: str,
+    test_data: dict,
+    gender: str,
+    D0: Optional[float] = None,
+    max_saturation: Optional[float] = None
+) -> float:
+    """
+    Вычисляет штрафной вклад [0..max_saturation] для неожиданных отклонений.
+
+    Логика:
+    - Для ВСЕХ статусов (above_normal, below_normal, critically_high, critically_low):
+      экспоненциальное насыщение от границы нормы
+    - Чем дальше от нормы, тем больше штраф
+    - Для normal: 0 (нормальные значения не штрафуем)
+
+    Это отличается от distance_contribution тем, что:
+    - distance_contribution: колокол для above/below_normal (максимум в центре)
+    - distance_penalty_contribution: экспонента для всех (чем дальше, тем хуже)
+
+    Args:
+        value: значение теста пациента
+        status: статус теста
+        test_data: данные теста из reference_ranges
+        gender: пол пациента
+        D0: параметр насыщения
+        max_saturation: максимальное значение насыщения
+
+    Returns:
+        float в диапазоне [0, max_saturation]
+    """
+    if D0 is None:
+        D0 = SCORING.D0
+    if max_saturation is None:
+        max_saturation = SCORING.MAX_SATURATION
+
+    if status == 'normal':
+        return 0.0
+
+    # Для всех отклонений используем расстояние от границы нормы
+    # Получаем нормальный диапазон
+    normal_range = test_data.get('normal_range', {})
+
+    ref = None
+    if isinstance(normal_range, dict):
+        if 'min' in normal_range and 'max' in normal_range:
+            ref = normal_range
+        else:
+            ref = normal_range.get(gender) or normal_range.get('unisex')
+            if not ref or not ('min' in ref and 'max' in ref):
+                for key, rng in normal_range.items():
+                    if isinstance(rng, dict) and 'min' in rng and 'max' in rng:
+                        ref = rng
+                        break
+
+    if not ref or 'min' not in ref or 'max' not in ref:
+        return 0.5  # fallback
+
+    ref_min = ref['min']
+    ref_max = ref['max']
+
+    # Вычисляем дистанцию от границы нормы
+    dist = 0.0
+
+    if status in ('above_normal', 'critically_high'):
+        # Выше нормы - считаем от верхней границы
+        if ref_max == 0:
+            dist = 0.0
+        else:
+            dist = max(0.0, (value - ref_max) / abs(ref_max))
+    elif status in ('below_normal', 'critically_low'):
+        # Ниже нормы - считаем от нижней границы
+        if ref_min == 0:
+            dist = 0.0
+        else:
+            dist = max(0.0, (ref_min - value) / abs(ref_min))
+
+    # Экспоненциальное насыщение с ограничением
+    contribution = 1.0 - math.exp(-dist / D0)
+    return min(max_saturation, contribution)
+
+
+def continuous_penalty(
+    idf_weight: float,
+    mult: float,
+    value: float,
+    status: str,
+    test_data: dict,
+    gender: str
+) -> float:
     """
     Штраф (положительное число), когда есть противоречие или «не в паттерне».
     mult — |severity_multiplier| либо небольшой минус в случаях с нормой.
+
+    Использует distance_penalty_contribution для корректного расчета штрафа
+    в зависимости от величины отклонения.
     """
     if idf_weight is None or idf_weight <= 0:
         return 0.0
-    g = distance_gain(dist)
-    return abs(float(idf_weight) * float(mult) * g)
+
+    contrib = distance_penalty_contribution(value, status, test_data, gender)
+    return abs(float(idf_weight) * float(mult) * contrib)
 
 
 def disease_categories_from_patterns(patterns: List) -> set:
@@ -665,35 +880,35 @@ class DiseaseSearchEngine:
     Поисковый движок для определения заболеваний
     Работает полностью in-memory с инвертированным индексом
     """
-    
+
     def __init__(self, reference_manager: ReferenceRangeManager):
         self.reference_manager = reference_manager
         self.diseases: Dict[str, Disease] = {}
-        
+
         # Инвертированный индекс: pattern_key -> [(disease_id, idf_weight, category)]
         self.pattern_index: Dict[str, List[Tuple[str, float, str]]] = defaultdict(list)
-        
+
         # Индекс по категориям: category -> [disease_ids]
         self.category_index: Dict[str, set] = defaultdict(set)
-        
+
         # IDF registry для неожиданных паттернов
         self.idf_registry: Dict[str, float] = {}
-    
+
     def load_diseases_from_json(self, json_path: str):
         """Загрузка заболеваний из JSON"""
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
         diseases_data = data.get('diseases', [])
         diseases_list = []
-        
+
         for disease_data in diseases_data:
             disease = Disease(
                 disease_id=disease_data['disease_id'],
                 canonical_name=disease_data['canonical_name'],
                 patterns=[]
             )
-            
+
             # Загружаем паттерны по категориям
             pattern_groups = disease_data.get('pattern_groups', {})
             for category, patterns in pattern_groups.items():
@@ -704,17 +919,17 @@ class DiseaseSearchEngine:
                         category=category
                     )
                     disease.patterns.append(pattern)
-            
+
             diseases_list.append(disease)
-        
+
         # Расчёт IDF весов
         IDFCalculator.calculate_idf_weights(diseases_list)
-        
+
         # Сохраняем в словарь и строим индексы
         for disease in diseases_list:
             self.diseases[disease.disease_id] = disease
             self._index_disease(disease)
-            
+
             # Заполняем IDF registry
             for pattern in disease.patterns:
                 test_info = self.reference_manager.find_test(pattern.test_name)
@@ -723,14 +938,14 @@ class DiseaseSearchEngine:
                     canonical_name = test_data['test_name']
                 else:
                     canonical_name = pattern.test_name
-                
+
                 pattern_key = self._make_pattern_key(canonical_name, pattern.expected_status)
                 if pattern_key not in self.idf_registry:
                     self.idf_registry[pattern_key] = pattern.idf_weight
-        
+
         print(f"✓ Loaded {len(self.diseases)} diseases into search engine")
         print(f"✓ Built IDF registry with {len(self.idf_registry)} patterns")
-    
+
     def _index_disease(self, disease: Disease):
         """Построение индексов для заболевания"""
         for pattern in disease.patterns:
@@ -741,20 +956,20 @@ class DiseaseSearchEngine:
                 canonical_name = test_data['test_name']
             else:
                 canonical_name = pattern.test_name
-            
+
             pattern_key = self._make_pattern_key(
                 canonical_name,
                 pattern.expected_status
             )
-            
+
             self.pattern_index[pattern_key].append((
                 disease.disease_id,
                 pattern.idf_weight,
                 pattern.category
             ))
-            
+
             self.category_index[pattern.category].add(disease.disease_id)
-    
+
     def search(
         self,
         patient_tests: List[TestResult],
@@ -765,8 +980,8 @@ class DiseaseSearchEngine:
         apply_contradiction_penalty: bool = True
     ) -> List[SearchResult]:
         """
-        Поиск заболеваний по результатам анализов пациента с непрерывным скорингом
-        
+        Поиск заболеваний по результатам анализов пациента с улучшенным непрерывным скорингом
+
         Args:
             patient_tests: Список результатов анализов
             top_k: Количество результатов
@@ -774,13 +989,13 @@ class DiseaseSearchEngine:
             categories: Фильтр по категориям анализов
             min_matched_patterns: Минимум совпадений для включения в результаты
             apply_contradiction_penalty: Применять ли штраф за противоречия
-        
+
         Returns:
             Список результатов, отсортированный по релевантности
         """
         # 1. Определяем статусы для всех тестов пациента
         patient_patterns: Dict[str, Dict] = {}
-        
+
         for test in patient_tests:
             status = self.reference_manager.calculate_status(
                 test.name,
@@ -788,10 +1003,10 @@ class DiseaseSearchEngine:
                 gender,
                 test.units
             )
-            
+
             if status == 'unknown':
                 continue
-            
+
             # Находим категорию теста и каноническое название
             test_info = self.reference_manager.find_test(test.name)
             if test_info:
@@ -800,7 +1015,8 @@ class DiseaseSearchEngine:
             else:
                 category = 'unknown'
                 canonical_name = test.name
-            
+                test_data = {}
+
             normalized_name = self._normalize(canonical_name)
             patient_patterns[normalized_name] = {
                 'status': status,
@@ -809,14 +1025,15 @@ class DiseaseSearchEngine:
                 'normalized_name': normalized_name,
                 'value': test.value,
                 'units': test.units,
-                'original_name': test.name
+                'original_name': test.name,
+                'test_data': test_data  # Сохраняем для distance_contribution
             }
             test.status = status
             test.category = category
-        
+
         if not patient_patterns:
             return []
-        
+
         # 2. Собираем релевантные заболевания через инвертированный индекс
         disease_scores: Dict[str, Dict] = defaultdict(lambda: {
             'matched_score': 0.0,
@@ -827,55 +1044,63 @@ class DiseaseSearchEngine:
             'redundant_data': [],
             'expected_patterns': []
         })
-        
+
         # Проходим по паттернам пациента
         for normalized_name, patient_info in patient_patterns.items():
             status = patient_info['status']
             category = patient_info['category']
             canonical_name = patient_info['canonical_name']
+            test_data = patient_info['test_data']
 
             # Фильтр по категориям
             if categories and category not in categories:
                 continue
-            
+
             pattern_key = self._make_pattern_key(canonical_name, status)
-            
+
             # Находим все заболевания с этим паттерном (O(1) lookup!)
             if pattern_key in self.pattern_index:
                 for disease_id, idf_weight, pattern_category in self.pattern_index[pattern_key]:
                     # Фильтр по категориям заболевания
                     if categories and pattern_category not in categories:
                         continue
-                    
-                    # Вычисляем непрерывную дистанцию
-                    dist, _ = self.reference_manager.distance_from_normal(
-                        canonical_name,
-                        patient_info['value'],
-                        gender,
-                        patient_info['units']
-                    )
-                    
-                    # Базовое совпадение с учетом дистанции
+
+                    # Базовое совпадение с использованием новой логики
                     mult = 1.0  # полное совпадение
-                    gain = continuous_contribution(idf_weight, mult, dist)
-                    
+                    gain = continuous_contribution(
+                        idf_weight,
+                        mult,
+                        patient_info['value'],
+                        status,
+                        test_data,
+                        gender
+                    )
+
+                    # Вычисляем вклад для детализации
+                    contrib = distance_contribution(
+                        patient_info['value'],
+                        status,
+                        test_data,
+                        gender
+                    )
+
                     disease_scores[disease_id]['matched_score'] += gain
                     disease_scores[disease_id]['matched_patterns'].append({
                         'test_name': canonical_name,
                         'status': status,
                         'idf_weight': idf_weight,
                         'category': pattern_category,
-                        'dist': dist,
+                        'contribution': contrib,
                         'gain': gain
                     })
-        
+
         # 3. Проверяем противоречия и missing data (только для найденных заболеваний)
         for disease_id in disease_scores.keys():
             disease = self.diseases[disease_id]
-            
+
             # Получаем категории болезни
             disease_cats = disease_categories_from_patterns(disease.patterns)
-            
+
             expected_entries = []
             pattern_name_map = {}
             unexpected_penalties = []
@@ -888,16 +1113,18 @@ class DiseaseSearchEngine:
                     canonical_name = test_data['test_name']
                 else:
                     canonical_name = pattern.test_name
-                
+                    test_data = {}
+
                 normalized_test = self._normalize(canonical_name)
 
                 pattern_name_map[normalized_test] = {
                     'expected_status': pattern.expected_status,
                     'idf_weight': pattern.idf_weight,
                     'category': pattern.category,
-                    'canonical_name': canonical_name
+                    'canonical_name': canonical_name,
+                    'test_data': test_data
                 }
-                
+
                 expected_entries.append({
                     'test_name': canonical_name,
                     'expected_status': pattern.expected_status,
@@ -910,22 +1137,15 @@ class DiseaseSearchEngine:
                     patient_info = patient_patterns[normalized_test]
                     patient_status = patient_info['status']
                     expected_status = pattern.expected_status
-                    
+
                     # Если паттерн уже совпал (найден через индекс), пропускаем
                     if patient_status == expected_status:
                         continue
-                    
+
                     # Статусы НЕ совпадают - это всегда штраф
                     # Вопрос только в силе штрафа
-                    dist, _ = self.reference_manager.distance_from_normal(
-                        canonical_name,
-                        patient_info['value'],
-                        gender,
-                        patient_info['units']
-                    )
-                    
                     mult = severity_multiplier(expected_status, patient_status)
-                    
+
                     if apply_contradiction_penalty:
                         if mult > 0:
                             # Направление совпадает, но тяжесть разная
@@ -936,10 +1156,25 @@ class DiseaseSearchEngine:
                             # Направление противоположное или ожидалась норма
                             # Полный штраф
                             penalty_multiplier = 1.0
-                        
-                        pen = continuous_penalty(pattern.idf_weight, penalty_multiplier, dist)
+
+                        pen = continuous_penalty(
+                            pattern.idf_weight,
+                            penalty_multiplier,
+                            patient_info['value'],
+                            patient_status,
+                            test_data,
+                            gender
+                        )
                         disease_scores[disease_id]['contradiction_penalty'] += pen
-                        
+
+                        # Вычисляем dist для отображения
+                        dist, _ = self.reference_manager.distance_from_normal(
+                            canonical_name,
+                            patient_info['value'],
+                            gender,
+                            patient_info['units']
+                        )
+
                         disease_scores[disease_id]['contradictions'].append({
                             'test_name': canonical_name,
                             'expected': expected_status,
@@ -974,7 +1209,7 @@ class DiseaseSearchEngine:
                 # Пропускаем тесты, которые уже в паттерне
                 if normalized_name in pattern_name_set:
                     continue
-                
+
                 # Фильтруем по категориям болезни
                 if patient_info['category'] not in disease_cats:
                     continue
@@ -996,7 +1231,7 @@ class DiseaseSearchEngine:
                     })
                     continue
 
-                # Вычисляем непрерывную дистанцию
+                # Вычисляем непрерывную дистанцию (для отображения)
                 dist, _ = self.reference_manager.distance_from_normal(
                     canonical_name,
                     user_value,
@@ -1008,9 +1243,23 @@ class DiseaseSearchEngine:
                 pattern_key = self._make_pattern_key(canonical_name, actual_status)
                 idf_for_unexpected = self.idf_registry.get(pattern_key, default_penalty)
 
+                # Получаем test_data для penalty calculation
+                test_info = self.reference_manager.find_test(canonical_name)
+                if test_info:
+                    _, test_data = test_info
+                else:
+                    test_data = {}
+
                 # Множитель: ожидали норму, получили отклонение
                 mult = severity_multiplier('normal', actual_status)
-                pen = continuous_penalty(idf_for_unexpected, mult, dist)
+                pen = continuous_penalty(
+                    idf_for_unexpected,
+                    mult,
+                    user_value,
+                    actual_status,
+                    test_data,
+                    gender
+                )
 
                 unexpected_penalties.append({
                     'test_name': canonical_name,
@@ -1330,50 +1579,6 @@ class MedicalLabAnalyzer:
             return "N/A"
         return f"{value:.6g}"
 
-    def print_results(self, results: List[SearchResult], detailed: bool = False):
-        """Красивый вывод результатов"""
-        if not results:
-            print("\n❌ No diseases found matching the patient's test results.")
-            return
-        
-        print("\n" + "=" * 80)
-        print(f"🔍 FOUND {len(results)} POTENTIAL DISEASES")
-        print("=" * 80)
-        
-        for i, result in enumerate(results, 1):
-            print(f"\n{'─' * 80}")
-            print(f"#{i}. {result.canonical_name} (ID: {result.disease_id})")
-            print(f"{'─' * 80}")
-            print(f"  📊 Match Score:       {result.total_score:.4f} / {result.max_possible_score:.4f}")
-            print(f"  📈 Normalized Score:  {result.normalized_score:.2%}")
-            print(f"  ✅ Matched Patterns:  {result.matched_patterns} / {result.total_patterns}")
-            print(f"  ⚠️  Contradictions:    {len(result.contradictions)}")
-            print(f"  ❓ Missing Data:      {len(result.missing_data)}")
-            
-            if detailed:
-                if result.matched_details:
-                    print("\n  ✅ Matched Patterns:")
-                    for match in result.matched_details:
-                        dist = match.get('dist', 0.0)
-                        gain = match.get('gain', 0.0)
-                        print(f"     • {match['test_name']}: {match['status']} "
-                              f"(IDF: {match['idf_weight']:.4f}, Dist: {dist:.3f}, Gain: {gain:.4f})")
-                
-                if result.contradictions:
-                    print("\n  ⚠️  Contradictions:")
-                    for contra in result.contradictions:
-                        dist = contra.get('dist', 0.0)
-                        print(f"     • {contra['test_name']}: expected {contra['expected']}, "
-                              f"got {contra['actual']} (Penalty: {contra['penalty']:.4f}, Dist: {dist:.3f})")
-                
-                if result.missing_data and len(result.missing_data) <= 5:
-                    print("\n  ❓ Missing Tests (top 5):")
-                    for missing in result.missing_data[:5]:
-                        print(f"     • {missing['test_name']}: {missing['expected_status']} "
-                              f"(IDF: {missing['idf_weight']:.4f})")
-        
-        print("\n" + "=" * 80)
-    
     # ============================================================
     # MongoDB Integration Methods
     # ============================================================
